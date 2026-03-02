@@ -7,7 +7,8 @@ from typing import Optional, List, Dict
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from langdetect import detect, LangDetectException
 
 # ---------------- ENV ----------------
@@ -15,10 +16,9 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
-# DB path (Render Free may reset; later you can switch to Postgres)
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
-# Admin alert chat (set after /adminid)
+# Set after you run /adminid in your private admin group
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))  # 0 = disabled
 
 bot = Bot(token=TOKEN)
@@ -27,7 +27,6 @@ dp = Dispatcher()
 # ---------------- Regex ----------------
 HASHTAG_RE = re.compile(r"#([\w\d_]+)", re.UNICODE)
 
-# Detect typical spam/ads patterns (tune later)
 SPAM_RE = re.compile(
     r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|joinchat/\S+|@\w{4,}|"
     r"\b\S+\.(com|net|org|ru|ua|ca|io|gg|me|shop)\b)",
@@ -76,11 +75,28 @@ def init_db():
         chat_id INTEGER NOT NULL,
         thread_id INTEGER NOT NULL,
         title TEXT,
-        required_tags TEXT,     -- csv, lowercase without '#'
-        recommend_tags TEXT,    -- csv, lowercase without '#'
+        required_tags TEXT,
+        recommend_tags TEXT,
         PRIMARY KEY (chat_id, thread_id)
     );
     """)
+
+    # Store pending alerts so we can act on them
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS spam_alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_ts INTEGER NOT NULL,
+        source_chat_id INTEGER NOT NULL,
+        source_msg_id INTEGER NOT NULL,
+        source_thread_id INTEGER,
+        source_user_id INTEGER,
+        source_username TEXT,
+        source_full_name TEXT,
+        reason TEXT
+    );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_spam_alerts_ts ON spam_alerts(created_ts);")
+
     con.commit()
     con.close()
 
@@ -164,10 +180,68 @@ def list_topic_rules(chat_id: int) -> List[tuple]:
     con.close()
     return rows
 
+def insert_spam_alert(source_msg: Message, reason: str) -> int:
+    con = db()
+    cur = con.cursor()
+    u = source_msg.from_user
+    cur.execute("""
+        INSERT INTO spam_alerts(
+            created_ts, source_chat_id, source_msg_id, source_thread_id,
+            source_user_id, source_username, source_full_name, reason
+        ) VALUES (?,?,?,?,?,?,?,?)
+    """, (
+        int(time.time()),
+        source_msg.chat.id,
+        source_msg.message_id,
+        source_msg.message_thread_id,
+        u.id if u else None,
+        u.username if u else None,
+        u.full_name if u else None,
+        reason
+    ))
+    con.commit()
+    alert_id = cur.lastrowid
+    con.close()
+    return alert_id
+
+def get_spam_alert(alert_id: int) -> Optional[dict]:
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, source_chat_id, source_msg_id, source_thread_id,
+               source_user_id, source_username, source_full_name, reason
+        FROM spam_alerts
+        WHERE id=?
+    """, (alert_id,))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "chat_id": row[1],
+        "msg_id": row[2],
+        "thread_id": row[3],
+        "user_id": row[4],
+        "username": row[5],
+        "full_name": row[6],
+        "reason": row[7],
+    }
+
+def build_moderation_kb(alert_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Allow", callback_data=f"mod:allow:{alert_id}")
+    kb.button(text="🗑 Delete", callback_data=f"mod:del:{alert_id}")
+    kb.button(text="🔇 Mute 24h", callback_data=f"mod:mute24:{alert_id}")
+    kb.button(text="⛔ Ban", callback_data=f"mod:ban:{alert_id}")
+    kb.adjust(2, 2)
+    return kb.as_markup()
+
 async def send_spam_alert(source_msg: Message, reason: str):
-    """Send alert + copy message to admin chat (if configured)."""
     if not ADMIN_CHAT_ID:
         return
+
+    alert_id = insert_spam_alert(source_msg, reason)
 
     u = source_msg.from_user
     who = f"{u.full_name} (@{u.username})" if u and u.username else (u.full_name if u else "unknown")
@@ -182,9 +256,10 @@ async def send_spam_alert(source_msg: Message, reason: str):
         f"Користувач: {who}\n"
         f"user_id: {u.id if u else '—'}\n"
         f"msg_id: {source_msg.message_id}\n"
+        f"alert_id: {alert_id}\n"
     )
 
-    await bot.send_message(ADMIN_CHAT_ID, text)
+    await bot.send_message(ADMIN_CHAT_ID, text, reply_markup=build_moderation_kb(alert_id))
     try:
         await bot.copy_message(
             chat_id=ADMIN_CHAT_ID,
@@ -198,21 +273,20 @@ async def send_spam_alert(source_msg: Message, reason: str):
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     await m.answer(
-        "🤖 Scitch Bot (Admin mode) активний.\n\n"
+        "🤖 Scitch Bot активний.\n\n"
         "Команди:\n"
-        "• /adminid — показати ID цього чату (використай у Scitch Admin)\n"
-        "• /ids — показати ID гілки (topic)\n"
+        "• /adminid — ID цього чату (використай у Scitch Admin)\n"
+        "• /ids — ID гілки (topic)\n"
         "• /setrules #tag1 #tag2 | #rec1 #rec2 — правила гілки (адмін)\n"
-        "• /rules — правила поточної гілки\n"
+        "• /rules — правила гілки\n"
         "• /listrules — всі правила (адмін)\n"
-        "• /clearrules — стерти правила гілки (адмін)\n"
+        "• /clearrules — стерти правила (адмін)\n"
         "• /search <текст> — пошук\n"
         "• /tag <#тег> — пошук по тегу\n"
     )
 
 @dp.message(Command("adminid"))
 async def cmd_adminid(m: Message):
-    # Use this inside your private "Scitch Admin" group to get its chat_id
     await m.reply(f"ADMIN_CHAT_ID: `{m.chat.id}`", parse_mode="Markdown")
 
 @dp.message(Command("ids"))
@@ -237,7 +311,7 @@ async def cmd_setrules(m: Message):
 
     raw = m.text.split(maxsplit=1)
     if len(raw) < 2:
-        await m.reply("Формат: /setrules #tag1 #tag2 | #rec1 #rec2\nПісля | — рекомендовані теги (необов’язково).")
+        await m.reply("Формат: /setrules #tag1 #tag2 | #rec1 #rec2")
         return
 
     text = raw[1].strip()
@@ -252,8 +326,7 @@ async def cmd_setrules(m: Message):
         await m.reply("Потрібно вказати хоча б 1 обов’язковий тег, напр. /setrules #оренда #здам")
         return
 
-    title = ""  # optional label
-    set_topic_rule(m.chat.id, tid, title, req_tags, rec_tags)
+    set_topic_rule(m.chat.id, tid, "", req_tags, rec_tags)
     await m.reply(
         "✅ Правила гілки збережено.\n"
         f"Обов’язкові: {' '.join('#'+t for t in req_tags)}\n"
@@ -270,7 +343,7 @@ async def cmd_rules(m: Message):
         return
     rule = get_topic_rule(m.chat.id, tid)
     if not rule:
-        await m.reply("Для цієї гілки правила тегів ще не задані. (Адмін: /setrules ...)")
+        await m.reply("Для цієї гілки правила ще не задані. (Адмін: /setrules ...)")
         return
 
     req = " ".join("#"+t for t in rule["required"]) if rule["required"] else "—"
@@ -373,74 +446,3 @@ async def cmd_tag(m: Message):
         who = f"@{username}" if username else (full_name or "user")
         preview = (text or "").replace("\n", " ")
         if len(preview) > 140:
-            preview = preview[:140] + "…"
-        out.append(f"• {time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))} | {who} | topic:{thread_id} | msg:{msg_id}\n  {preview}")
-    await m.reply("\n".join(out))
-
-# ---------------- Main handler: index + soft moderation ----------------
-# IMPORTANT: ignore commands so they don't block /adminid etc.
-@dp.message(F.text & ~F.text.startswith("/"))
-async def on_text(m: Message):
-    if m.chat.type not in ("group", "supergroup"):
-        return
-
-    text = m.text or ""
-    tid = m.message_thread_id
-    uid = m.from_user.id if m.from_user else 0
-    username = m.from_user.username if m.from_user else ""
-    full_name = m.from_user.full_name if m.from_user else ""
-    ts = int(time.time())
-
-    tags = extract_tags(text)
-    tags_csv = ",".join(tags)
-
-    # Index message for search
-    con = db()
-    con.execute("""
-      INSERT INTO messages(chat_id, msg_id, thread_id, user_id, username, full_name, ts, text, tags)
-      VALUES(?,?,?,?,?,?,?,?,?)
-    """, (m.chat.id, m.message_id, tid, uid, username, full_name, ts, text, tags_csv))
-    con.commit()
-    con.close()
-
-    # UA-only (soft)
-    if len(text.strip()) >= 12 and not is_ukrainian(text):
-        if cooldown_ok(_last_lang, (m.chat.id, uid), LANG_COOLDOWN_SEC):
-            await m.reply(
-                "🇺🇦 У чаті пости публікуються українською.\n"
-                "Будь ласка, продублюйте/перепишіть ваше повідомлення українською.\n\n"
-                "🇫🇷 Le chat publie les messages en ukrainien.\n"
-                "Merci de republier votre message en ukrainien."
-            )
-
-    # Hashtag rules per topic (soft)
-    if tid:
-        rule = get_topic_rule(m.chat.id, tid)
-        if rule and rule["required"]:
-            required = set(rule["required"])
-            ok = bool(set(tags) & required)
-            if not ok and cooldown_ok(_last_tag, (m.chat.id, uid), TAG_COOLDOWN_SEC):
-                req_preview = " ".join("#"+t for t in rule["required"][:10])
-                rec_preview = " ".join("#"+t for t in rule["recommend"][:8]) if rule["recommend"] else ""
-                msg = (
-                    "🧩 Підказка по хештегам:\n"
-                    f"Додайте 1 тег: {req_preview}\n"
-                )
-                if rec_preview:
-                    msg += f"Рекомендую: {rec_preview}\n"
-                msg += "Приклад: #... + короткий опис (ціна/район/дата тощо)."
-                await m.reply(msg)
-
-    # Spam/ads link alert to admin chat (soft, no deletion)
-    if ADMIN_CHAT_ID and SPAM_RE.search(text):
-        # avoid alert flood per user
-        if cooldown_ok(_last_spam, (m.chat.id, uid), SPAM_ALERT_COOLDOWN_SEC):
-            await send_spam_alert(m, "Лінк/реклама/username або домен у повідомленні")
-
-async def main():
-    init_db()
-    print("Bot running…")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
