@@ -10,24 +10,38 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from langdetect import detect, LangDetectException
 
+# ---------------- ENV ----------------
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
-# If you added Render Disk, DB will persist:
-DB_PATH = os.environ.get("DB_PATH", "/var/data/bot.db")  # fallback to local if no disk
-# For no-disk mode you can set DB_PATH="bot.db" in Render env vars.
+# DB path (Render Free may reset; later you can switch to Postgres)
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
+
+# Admin alert chat (set after /adminid)
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))  # 0 = disabled
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# ---------------- Regex ----------------
 HASHTAG_RE = re.compile(r"#([\w\d_]+)", re.UNICODE)
 
-# Soft moderation cooldowns
+# Detect typical spam/ads patterns (tune later)
+SPAM_RE = re.compile(
+    r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|joinchat/\S+|@\w{4,}|"
+    r"\b\S+\.(com|net|org|ru|ua|ca|io|gg|me|shop)\b)",
+    re.IGNORECASE
+)
+
+# ---------------- Cooldowns ----------------
 LANG_COOLDOWN_SEC = 120
 TAG_COOLDOWN_SEC = 90
+SPAM_ALERT_COOLDOWN_SEC = 180
+
 _last_lang: Dict[tuple, int] = {}
 _last_tag: Dict[tuple, int] = {}
+_last_spam: Dict[tuple, int] = {}
 
 # ---------------- DB ----------------
 def db():
@@ -57,7 +71,6 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_chat_text ON messages(chat_id, text);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_chat_tags ON messages(chat_id, tags);")
 
-    # Topic rules set by admins inside each topic
     cur.execute("""
     CREATE TABLE IF NOT EXISTS topic_rules (
         chat_id INTEGER NOT NULL,
@@ -92,11 +105,6 @@ def cooldown_ok(store: dict, key: tuple, cooldown: int) -> bool:
         return False
     store[key] = now
     return True
-
-def is_admin(message: Message) -> bool:
-    # simple admin check using Telegram API
-    # (works only in groups/supergroups)
-    return True  # placeholder, checked asynchronously below
 
 async def is_admin_async(m: Message) -> bool:
     try:
@@ -156,20 +164,56 @@ def list_topic_rules(chat_id: int) -> List[tuple]:
     con.close()
     return rows
 
+async def send_spam_alert(source_msg: Message, reason: str):
+    """Send alert + copy message to admin chat (if configured)."""
+    if not ADMIN_CHAT_ID:
+        return
+
+    u = source_msg.from_user
+    who = f"{u.full_name} (@{u.username})" if u and u.username else (u.full_name if u else "unknown")
+    chat_title = source_msg.chat.title or str(source_msg.chat.id)
+    thread = source_msg.message_thread_id
+
+    text = (
+        "🚨 Можлива реклама/лінк\n"
+        f"Причина: {reason}\n"
+        f"Чат: {chat_title}\n"
+        f"Гілка(topic): {thread}\n"
+        f"Користувач: {who}\n"
+        f"user_id: {u.id if u else '—'}\n"
+        f"msg_id: {source_msg.message_id}\n"
+    )
+
+    await bot.send_message(ADMIN_CHAT_ID, text)
+    try:
+        await bot.copy_message(
+            chat_id=ADMIN_CHAT_ID,
+            from_chat_id=source_msg.chat.id,
+            message_id=source_msg.message_id
+        )
+    except:
+        pass
+
 # ---------------- Commands ----------------
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     await m.answer(
         "🤖 Scitch Bot (Admin mode) активний.\n\n"
         "Команди:\n"
-        "• /ids — показати ID гілки\n"
-        "• /setrules #tag1 #tag2 | #rec1 #rec2 — задати правила гілки (адмін)\n"
-        "• /rules — показати правила поточної гілки\n"
-        "• /listrules — список правил усіх гілок (адмін)\n"
-        "• /clearrules — стерти правила поточної гілки (адмін)\n"
-        "• /search <текст> — пошук по чату\n"
+        "• /adminid — показати ID цього чату (використай у Scitch Admin)\n"
+        "• /ids — показати ID гілки (topic)\n"
+        "• /setrules #tag1 #tag2 | #rec1 #rec2 — правила гілки (адмін)\n"
+        "• /rules — правила поточної гілки\n"
+        "• /listrules — всі правила (адмін)\n"
+        "• /clearrules — стерти правила гілки (адмін)\n"
+        "• /search <текст> — пошук\n"
         "• /tag <#тег> — пошук по тегу\n"
     )
+
+@dp.message(Command("adminid"))
+async def cmd_adminid(m: Message):
+    # Use this inside your private "Scitch Admin" group to get its chat_id
+    await m.reply(f"ADMIN_CHAT_ID: `{m.chat.id}`", parse_mode="Markdown")
 
 @dp.message(Command("ids"))
 async def cmd_ids(m: Message):
@@ -191,7 +235,6 @@ async def cmd_setrules(m: Message):
         await m.reply("Використай /setrules всередині потрібної гілки (topic).")
         return
 
-    # Format: /setrules #a #b #c | #x #y
     raw = m.text.split(maxsplit=1)
     if len(raw) < 2:
         await m.reply("Формат: /setrules #tag1 #tag2 | #rec1 #rec2\nПісля | — рекомендовані теги (необов’язково).")
@@ -206,11 +249,10 @@ async def cmd_setrules(m: Message):
     rec_tags = [t.lower().lstrip("#") for t in rec_part.split() if t.strip().startswith("#")]
 
     if not req_tags:
-        await m.reply("Потрібно вказати хоча б 1 обов’язковий тег після /setrules, напр. /setrules #оренда #здам")
+        await m.reply("Потрібно вказати хоча б 1 обов’язковий тег, напр. /setrules #оренда #здам")
         return
 
-    # Use current topic title as label (manual label)
-    title = (m.reply_to_message.text[:32] if m.reply_to_message and m.reply_to_message.text else "")
+    title = ""  # optional label
     set_topic_rule(m.chat.id, tid, title, req_tags, rec_tags)
     await m.reply(
         "✅ Правила гілки збережено.\n"
@@ -233,7 +275,7 @@ async def cmd_rules(m: Message):
 
     req = " ".join("#"+t for t in rule["required"]) if rule["required"] else "—"
     rec = " ".join("#"+t for t in rule["recommend"]) if rule["recommend"] else "—"
-    await m.reply(f"🏷 Правила тегів для цієї гілки:\nОбов’язкові: {req}\nРекомендовані: {rec}")
+    await m.reply(f"🏷 Правила тегів:\nОбов’язкові: {req}\nРекомендовані: {rec}")
 
 @dp.message(Command("listrules"))
 async def cmd_listrules(m: Message):
@@ -249,7 +291,7 @@ async def cmd_listrules(m: Message):
         return
 
     lines = ["🧵 Правила по гілках:"]
-    for thread_id, title, req, rec in rows:
+    for thread_id, _title, req, rec in rows:
         req_s = " ".join("#"+t for t in (req or "").split(",") if t) or "—"
         rec_s = " ".join("#"+t for t in (rec or "").split(",") if t) or "—"
         lines.append(f"• topic:{thread_id}\n  Обов’язк.: {req_s}\n  Рек.: {rec_s}")
@@ -336,7 +378,8 @@ async def cmd_tag(m: Message):
     await m.reply("\n".join(out))
 
 # ---------------- Main handler: index + soft moderation ----------------
-@dp.message(F.text)
+# IMPORTANT: ignore commands so they don't block /adminid etc.
+@dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(m: Message):
     if m.chat.type not in ("group", "supergroup"):
         return
@@ -388,6 +431,12 @@ async def on_text(m: Message):
                 msg += "Приклад: #... + короткий опис (ціна/район/дата тощо)."
                 await m.reply(msg)
 
+    # Spam/ads link alert to admin chat (soft, no deletion)
+    if ADMIN_CHAT_ID and SPAM_RE.search(text):
+        # avoid alert flood per user
+        if cooldown_ok(_last_spam, (m.chat.id, uid), SPAM_ALERT_COOLDOWN_SEC):
+            await send_spam_alert(m, "Лінк/реклама/username або домен у повідомленні")
+
 async def main():
     init_db()
     print("Bot running…")
@@ -395,6 +444,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-@dp.message(Command("adminid"))
-async def admin_id(message: Message):
-    await message.reply(f"ADMIN_CHAT_ID: {message.chat.id}")
