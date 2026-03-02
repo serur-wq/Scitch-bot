@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import ChatPermissions
 from langdetect import detect, LangDetectException
 
 # ---------------- ENV ----------------
@@ -16,9 +17,12 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
+# On Render Free, use local file; it may reset on restart (OK for now).
+# You can override with DB_PATH env var.
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
-# Set after you run /adminid in your private admin group
+# Set after you run /adminid in your private admin group:
+# ADMIN_CHAT_ID = -100xxxxxxxxxx
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))  # 0 = disabled
 
 bot = Bot(token=TOKEN)
@@ -27,9 +31,10 @@ dp = Dispatcher()
 # ---------------- Regex ----------------
 HASHTAG_RE = re.compile(r"#([\w\d_]+)", re.UNICODE)
 
+# Links / invites / domains / @usernames (ads)
 SPAM_RE = re.compile(
-    r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|joinchat/\S+|@\w{4,}|"
-    r"\b\S+\.(com|net|org|ru|ua|ca|io|gg|me|shop)\b)",
+    r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|joinchat/\S+|"
+    r"@\w{4,}|\b\S+\.(com|net|org|ru|ua|ca|io|gg|me|shop)\b)",
     re.IGNORECASE
 )
 
@@ -51,6 +56,8 @@ def db():
 def init_db():
     con = db()
     cur = con.cursor()
+
+    # indexed messages
     cur.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,18 +77,19 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_chat_text ON messages(chat_id, text);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_chat_tags ON messages(chat_id, tags);")
 
+    # topic hashtag rules
     cur.execute("""
     CREATE TABLE IF NOT EXISTS topic_rules (
         chat_id INTEGER NOT NULL,
         thread_id INTEGER NOT NULL,
         title TEXT,
-        required_tags TEXT,
-        recommend_tags TEXT,
+        required_tags TEXT,     -- csv, lowercase without '#'
+        recommend_tags TEXT,    -- csv, lowercase without '#'
         PRIMARY KEY (chat_id, thread_id)
     );
     """)
 
-    # Store pending alerts so we can act on them
+    # store spam alerts for moderation buttons
     cur.execute("""
     CREATE TABLE IF NOT EXISTS spam_alerts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -414,7 +422,10 @@ async def cmd_search(m: Message):
         preview = (text or "").replace("\n", " ")
         if len(preview) > 140:
             preview = preview[:140] + "…"
-        out.append(f"• {time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))} | {who} | topic:{thread_id} | msg:{msg_id}\n  {preview}")
+        out.append(
+            f"• {time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))} | {who} | "
+            f"topic:{thread_id} | msg:{msg_id}\n  {preview}"
+        )
     await m.reply("\n".join(out))
 
 @dp.message(Command("tag"))
@@ -446,3 +457,147 @@ async def cmd_tag(m: Message):
         who = f"@{username}" if username else (full_name or "user")
         preview = (text or "").replace("\n", " ")
         if len(preview) > 140:
+            preview = preview[:140] + "…"
+        out.append(
+            f"• {time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))} | {who} | "
+            f"topic:{thread_id} | msg:{msg_id}\n  {preview}"
+        )
+    await m.reply("\n".join(out))
+
+# ---------------- Moderation buttons (callbacks) ----------------
+@dp.callback_query(F.data.startswith("mod:"))
+async def on_mod_action(cq: CallbackQuery):
+    # Extra safety: actions should be used in admin chat only
+    if ADMIN_CHAT_ID and cq.message and cq.message.chat.id != ADMIN_CHAT_ID:
+        await cq.answer("Дія доступна тільки в Admin-чаті.", show_alert=True)
+        return
+
+    parts = cq.data.split(":")
+    if len(parts) != 3:
+        await cq.answer("Невірні дані.", show_alert=True)
+        return
+
+    action, alert_id_s = parts[1], parts[2]
+    try:
+        alert_id = int(alert_id_s)
+    except:
+        await cq.answer("Невірний alert_id.", show_alert=True)
+        return
+
+    alert = get_spam_alert(alert_id)
+    if not alert:
+        await cq.answer("Alert не знайдено (можливо старий).", show_alert=True)
+        return
+
+    chat_id = alert["chat_id"]
+    msg_id = alert["msg_id"]
+    user_id = alert["user_id"]
+
+    try:
+        if action == "allow":
+            await cq.answer("OK")
+            await cq.message.reply("✅ Allow: залишаємо як є.")
+            return
+
+        if action == "del":
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            await cq.answer("Deleted")
+            await cq.message.reply("🗑 Видалено повідомлення в основному чаті.")
+            return
+
+        if action == "mute24":
+            if not user_id:
+                await cq.answer("Нема user_id.", show_alert=True)
+                return
+            until = int(time.time()) + 24 * 3600
+            perms = ChatPermissions(can_send_messages=False)
+            await bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=perms,
+                until_date=until
+            )
+            await cq.answer("Muted")
+            await cq.message.reply("🔇 Користувача зам’ючено на 24 години.")
+            return
+
+        if action == "ban":
+            if not user_id:
+                await cq.answer("Нема user_id.", show_alert=True)
+                return
+            await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+            await cq.answer("Banned")
+            await cq.message.reply("⛔ Користувача забанено.")
+            return
+
+        await cq.answer("Невідома дія.", show_alert=True)
+
+    except Exception as e:
+        await cq.answer(f"Помилка: {type(e).__name__}", show_alert=True)
+
+# ---------------- Main handler: index + soft moderation ----------------
+# IMPORTANT: ignore commands so they don't block /adminid etc.
+@dp.message(F.text & ~F.text.startswith("/"))
+async def on_text(m: Message):
+    if m.chat.type not in ("group", "supergroup"):
+        return
+
+    text = m.text or ""
+    tid = m.message_thread_id
+    uid = m.from_user.id if m.from_user else 0
+    username = m.from_user.username if m.from_user else ""
+    full_name = m.from_user.full_name if m.from_user else ""
+    ts = int(time.time())
+
+    tags = extract_tags(text)
+    tags_csv = ",".join(tags)
+
+    # Index for search
+    con = db()
+    con.execute("""
+      INSERT INTO messages(chat_id, msg_id, thread_id, user_id, username, full_name, ts, text, tags)
+      VALUES(?,?,?,?,?,?,?,?,?)
+    """, (m.chat.id, m.message_id, tid, uid, username, full_name, ts, text, tags_csv))
+    con.commit()
+    con.close()
+
+    # UA-only (soft)
+    if len(text.strip()) >= 12 and not is_ukrainian(text):
+        if cooldown_ok(_last_lang, (m.chat.id, uid), LANG_COOLDOWN_SEC):
+            await m.reply(
+                "🇺🇦 У чаті пости публікуються українською.\n"
+                "Будь ласка, продублюйте/перепишіть ваше повідомлення українською.\n\n"
+                "🇫🇷 Le chat publie les messages en ukrainien.\n"
+                "Merci de republier votre message en ukrainien."
+            )
+
+    # Hashtag rules per topic (soft)
+    if tid:
+        rule = get_topic_rule(m.chat.id, tid)
+        if rule and rule["required"]:
+            required = set(rule["required"])
+            ok = bool(set(tags) & required)
+            if not ok and cooldown_ok(_last_tag, (m.chat.id, uid), TAG_COOLDOWN_SEC):
+                req_preview = " ".join("#"+t for t in rule["required"][:10])
+                rec_preview = " ".join("#"+t for t in rule["recommend"][:8]) if rule["recommend"] else ""
+                msg = (
+                    "🧩 Підказка по хештегам:\n"
+                    f"Додайте 1 тег: {req_preview}\n"
+                )
+                if rec_preview:
+                    msg += f"Рекомендую: {rec_preview}\n"
+                msg += "Приклад: #... + короткий опис (ціна/район/дата тощо)."
+                await m.reply(msg)
+
+    # Spam alert to admin chat (soft, no deletion in main chat)
+    if ADMIN_CHAT_ID and SPAM_RE.search(text):
+        if cooldown_ok(_last_spam, (m.chat.id, uid), SPAM_ALERT_COOLDOWN_SEC):
+            await send_spam_alert(m, "Лінк/реклама/username або домен у повідомленні")
+
+async def main():
+    init_db()
+    print("Bot running…")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
